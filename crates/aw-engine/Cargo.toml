@@ -10,6 +10,7 @@ libc.workspace = true
 audiopus_sys = "0.2"      # libopus (C)
 symphonia = { version = "0.5", features = ["mp3", "aac", "flac", "ogg", "vorbis", "wav", "isomp4", "mkv"] }
 rubato = "0.15"
+ureq = "2"                # blocking HTTP (rustls) for the producer thread
 
 [build-dependencies]
 cc = "1"
