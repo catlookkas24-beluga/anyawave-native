@@ -1,0 +1,2 @@
+# anyawave-native
+Lavalink AnyaMusic
