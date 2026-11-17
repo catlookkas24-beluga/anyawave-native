@@ -29,6 +29,8 @@ use std::{
 };
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
+mod filters;
+
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
@@ -89,6 +91,7 @@ async fn main() {
         .route("/v4/stats", get(stats))
         .route("/v4/loadtracks", get(load_tracks))
         .route("/v4/decodetrack", get(decode_track))
+        .route("/v4/filters", get(|| async { Json(filters::schema()) }))
         .route("/v4/websocket", get(ws))
         .route("/v4/sessions/:sid", patch(patch_session))
         .route("/v4/sessions/:sid/players", get(list_players))
@@ -104,7 +107,7 @@ async fn main() {
 async fn info() -> Json<Value> {
     Json(json!({"version":{"semver":"4.0.0","major":4,"minor":0,"patch":0},
         "buildTime":0,"git":{"branch":"main","commit":"dev","commitTime":0},"jvm":"n/a","lavaplayer":"n/a",
-        "sourceManagers":["http"],"filters":["volume","equalizer","tremolo"],"plugins":[]}))
+        "sourceManagers":["http"],"filters":["volume","equalizer","karaoke","timescale","tremolo","vibrato","distortion","rotation","channelMix","lowPass","preamp","parametricEq","stereo","echo","reverb","compressor","limiter","preset"],"plugins":[]}))
 }
 
 fn stats_json(app: &App) -> Value {
@@ -225,21 +228,7 @@ fn start_track(p: &mut Player, sess: &Session, url: String, track: Value, start_
 }
 
 fn refresh_chain(p: &Player) {
-    let f = &p.filters;
-    let mut gains = [0f32; 15];
-    if let Some(arr) = f["equalizer"].as_array() {
-        for b in arr {
-            if let (Some(i), Some(g)) = (b["band"].as_u64(), b["gain"].as_f64()) { if i < 15 { gains[i as usize] = g as f32; } }
-        }
-    }
-    let tf = f["tremolo"]["frequency"].as_f64().unwrap_or(0.0) as f32;
-    let td = f["tremolo"]["depth"].as_f64().unwrap_or(0.0) as f32;
-    let fv = f["volume"].as_f64().unwrap_or(1.0) as f32;
-    if let Ok(mut c) = p.chain.lock() {
-        c.set_eq(&gains);
-        c.set_tremolo(tf, td);
-        c.set_volume(p.volume as f32 / 100.0 * fv);
-    }
+    if let Ok(mut c) = p.chain.lock() { filters::apply(&mut c, &p.filters, p.volume); }
 }
 
 fn get_session(app: &App, sid: &str) -> Option<Arc<Session>> { app.sessions.lock().unwrap().get(sid).cloned() }
