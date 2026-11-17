@@ -1,37 +1,85 @@
-//! Safe wrapper over cpp/dave_bridge.h  (Discord libdave / MLS).
-use std::ffi::c_void;
-#[repr(C)] pub struct AwDave { _p: [u8; 0] }
-extern "C" {
-    fn aw_dave_new(user: u64, channel: u64) -> *mut AwDave;
-    fn aw_dave_free(d: *mut AwDave);
-    fn aw_dave_init(d: *mut AwDave, ver: u16) -> i32;
-    fn aw_dave_set_external_sender(d: *mut AwDave, p: *const u8, n: usize);
-    fn aw_dave_key_package(d: *mut AwDave, out: *mut u8, cap: usize) -> i32;
-    fn aw_dave_process_commit(d: *mut AwDave, p: *const u8, n: usize) -> i32;
-    fn aw_dave_execute_transition(d: *mut AwDave, id: u16);
-    fn aw_dave_max_ct(d: *mut AwDave, n: usize) -> usize;
-    fn aw_dave_encrypt(d: *mut AwDave, ssrc: u32, i: *const u8, n: usize, o: *mut u8, cap: usize) -> i32;
+//! DAVE (E2EE) session using the pure-Rust `davey` crate (MLS via OpenMLS).
+//! Call order mirrors the Discord docs / @snazzah/davey usage:
+//!   op4 version>0 -> init() -> send key package (op26)
+//!   op25 -> set_external_sender
+//!   op27 -> process_proposals -> send commit(+welcome) (op28)
+//!   op29 -> process_commit   -> send transition ready (op23)
+//!   op30 -> process_welcome  -> send transition ready (op23)
+//! Until the group is ready, frames go out unencrypted (passthrough) so audio never blocks on the handshake.
+use davey::{DaveSession, ProposalsOperationType};
+use std::num::NonZeroU16;
+
+pub struct CommitWelcome { pub commit: Vec<u8>, pub welcome: Option<Vec<u8>> }
+
+pub struct DaveCtx {
+    session: Option<DaveSession>,
+    user_id: u64,
+    channel_id: u64,
+    pub version: u16,
+    pub passthrough: bool,
 }
-pub struct Dave { raw: *mut AwDave, pub version: u16 }
-unsafe impl Send for Dave {}
-impl Dave {
-    pub fn new(user: u64, channel: u64) -> Self { Self { raw: unsafe { aw_dave_new(user, channel) }, version: 0 } }
-    pub fn init(&mut self, v: u16) { self.version = v; unsafe { aw_dave_init(self.raw, v); } }
-    pub fn set_external_sender(&mut self, d: &[u8]) { unsafe { aw_dave_set_external_sender(self.raw, d.as_ptr(), d.len()) } }
-    pub fn key_package(&mut self) -> Vec<u8> {
-        let mut b = vec![0u8; 4096];
-        let n = unsafe { aw_dave_key_package(self.raw, b.as_mut_ptr(), b.len()) };
-        b.truncate(n.max(0) as usize); b
+
+impl DaveCtx {
+    pub fn new(user_id: u64, channel_id: u64) -> Self {
+        Self { session: None, user_id, channel_id, version: 0, passthrough: true }
     }
-    pub fn process_commit(&mut self, d: &[u8]) -> bool { unsafe { aw_dave_process_commit(self.raw, d.as_ptr(), d.len()) == 0 } }
-    pub fn execute_transition(&mut self, id: u16) { unsafe { aw_dave_execute_transition(self.raw, id) } }
-    /// hot path: called once per 20 ms per player, writes into a reusable buffer
-    pub fn encrypt(&mut self, ssrc: u32, frame: &[u8], out: &mut Vec<u8>) -> bool {
-        if self.version == 0 { out.clear(); out.extend_from_slice(frame); return true; }
-        let cap = unsafe { aw_dave_max_ct(self.raw, frame.len()) };
-        out.resize(cap, 0);
-        let n = unsafe { aw_dave_encrypt(self.raw, ssrc, frame.as_ptr(), frame.len(), out.as_mut_ptr(), cap) };
-        if n < 0 { return false; } out.truncate(n as usize); true
+
+    /// (Re)initialise for `version`. Returns the key package to send as op 26 (None when version == 0).
+    pub fn init(&mut self, version: u16) -> Result<Option<Vec<u8>>, String> {
+        self.version = version;
+        if version == 0 {
+            if let Some(s) = &mut self.session {
+                s.reset().map_err(|e| e.to_string())?;
+                s.set_passthrough_mode(true, Some(10));
+            }
+            self.passthrough = true;
+            return Ok(None);
+        }
+        let v = NonZeroU16::new(version).ok_or("invalid DAVE version")?;
+        if let Some(s) = &mut self.session {
+            s.reinit(v, self.user_id, self.channel_id, None).map_err(|e| e.to_string())?;
+        } else {
+            self.session = Some(DaveSession::new(v, self.user_id, self.channel_id, None).map_err(|e| e.to_string())?);
+        }
+        self.passthrough = false;
+        let kp = self.session.as_mut().unwrap().create_key_package().map_err(|e| e.to_string())?;
+        Ok(Some(kp))
+    }
+
+    pub fn set_external_sender(&mut self, d: &[u8]) -> Result<(), String> {
+        match &mut self.session { Some(s) => s.set_external_sender(d).map_err(|e| e.to_string()), None => Ok(()) }
+    }
+
+    pub fn process_proposals(&mut self, op_type: u8, proposals: &[u8]) -> Result<Option<CommitWelcome>, String> {
+        let Some(s) = &mut self.session else { return Ok(None) };
+        let op = if op_type == 1 { ProposalsOperationType::REVOKE } else { ProposalsOperationType::APPEND };
+        let r = s.process_proposals(op, proposals, None).map_err(|e| e.to_string())?;
+        Ok(r.map(|cw| CommitWelcome { commit: cw.commit.to_vec(), welcome: cw.welcome.map(|w| w.to_vec()) }))
+    }
+
+    pub fn process_commit(&mut self, d: &[u8]) -> Result<(), String> {
+        match &mut self.session { Some(s) => s.process_commit(d).map_err(|e| e.to_string()), None => Ok(()) }
+    }
+
+    pub fn process_welcome(&mut self, d: &[u8]) -> Result<(), String> {
+        match &mut self.session { Some(s) => s.process_welcome(d).map_err(|e| e.to_string()), None => Ok(()) }
+    }
+
+    pub fn is_ready(&self) -> bool { self.session.as_ref().map_or(false, |s| s.is_ready()) }
+
+    /// hot path (every 20 ms per player). Plain copy when E2EE is not active/ready.
+    pub fn encrypt(&mut self, frame: &[u8], out: &mut Vec<u8>) -> Result<(), String> {
+        out.clear();
+        if !self.passthrough {
+            if let Some(s) = &mut self.session {
+                if s.is_ready() {
+                    let enc = s.encrypt_opus(frame).map_err(|e| e.to_string())?;
+                    out.extend_from_slice(&enc[..]);
+                    return Ok(());
+                }
+            }
+        }
+        out.extend_from_slice(frame);
+        Ok(())
     }
 }
-impl Drop for Dave { fn drop(&mut self) { unsafe { aw_dave_free(self.raw) } } }
