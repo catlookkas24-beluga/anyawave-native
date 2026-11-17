@@ -2,20 +2,17 @@
 name = "aw-voice"
 version = "0.1.0"
 edition = "2021"
-
-[build-dependencies]
-cc = "1"
+build = false          # the old C++ bridge build script is no longer used (DAVE is pure Rust via `davey`)
 
 [dependencies]
 aw-engine = { path = "../aw-engine" }
 tokio.workspace = true
 tokio-tungstenite.workspace = true
 futures-util.workspace = true
-serde.workspace = true
 serde_json.workspace = true
-bytes.workspace = true
 tracing.workspace = true
 aes-gcm.workspace = true
 chacha20poly1305.workspace = true
 socket2.workspace = true
-libc.workspace = true
+rtrb.workspace = true
+davey = "0.1"          # Discord DAVE (MLS) E2EE, MIT, pure Rust
