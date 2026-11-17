@@ -12,7 +12,7 @@ use rtrb::{Consumer, Producer, RingBuffer};
 use rubato::{FftFixedIn, Resampler};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering::{Relaxed, SeqCst}};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use symphonia::core::audio::SampleBuffer;
 use symphonia::core::codecs::{Decoder, DecoderOptions, CODEC_TYPE_NULL, CODEC_TYPE_OPUS};
@@ -25,9 +25,34 @@ use symphonia::core::units::Time;
 
 pub const MAX_PACKET: usize = 1275;
 pub const FRAME_SAMPLES: usize = 960; // per channel, 20 ms @ 48 kHz
-pub const RING_FRAMES: usize = 48;
-pub const TARGET_AHEAD: usize = 15; // ~300 ms buffered ahead of the network clock
-pub const BITRATE: i32 = 128_000;
+pub const RING_FRAMES: usize = 128;          // hard capacity (~2.5 s). Actual fill target = AW_BUFFER_MS
+pub const BASE_COMPLEXITY: i32 = 6;
+
+/// Runtime tuning (env vars) so one binary fits both a 0.1-vCPU free host and a big VPS.
+///   AW_BITRATE    Opus bitrate in bit/s, 6000..510000 (default 128000). Opus is the ONLY codec Discord voice accepts.
+///   AW_BUFFER_MS  how far ahead the producer fills the ring (default 1000). Bigger = survives CPU throttling.
+///   AW_ADAPTIVE   1 (default) = lower Opus complexity automatically while the buffer is draining.
+pub struct Config { pub bitrate: i32, pub complexity: i32, pub unconstrained_vbr: bool, pub target_ahead: usize, pub adaptive: bool }
+fn env_i(k: &str, d: i64) -> i64 { std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d) }
+pub fn cfg() -> &'static Config {
+    static C: OnceLock<Config> = OnceLock::new();
+    C.get_or_init(|| {
+      // AW_QUALITY: eco | balanced (default) | high | max   (AW_BITRATE overrides the bitrate)
+      let (br, cx, unc) = match std::env::var("AW_QUALITY").unwrap_or_default().as_str() {
+          "eco" => (64_000, 4, false),
+          "high" => (192_000, 9, false),
+          "max" => (320_000, 10, true),
+          _ => (128_000, BASE_COMPLEXITY as i64, false),
+      };
+      Config {
+        bitrate: env_i("AW_BITRATE", br).clamp(6_000, 510_000) as i32,
+        complexity: cx as i32,
+        unconstrained_vbr: unc,
+        target_ahead: ((env_i("AW_BUFFER_MS", 1000) / 20).clamp(5, (RING_FRAMES - 2) as i64)) as usize,
+        adaptive: env_i("AW_ADAPTIVE", 1) != 0,
+      }
+    })
+}
 
 // libopus ctl numbers (stable ABI constants from opus_defines.h)
 const OPUS_APPLICATION_AUDIO: i32 = 2049;
@@ -35,6 +60,10 @@ const OPUS_SET_BITRATE: i32 = 4002;
 const OPUS_SET_VBR: i32 = 4006;
 const OPUS_SET_COMPLEXITY: i32 = 4010;
 const OPUS_SET_SIGNAL: i32 = 4024;
+const OPUS_SET_MAX_BANDWIDTH: i32 = 4004;
+const OPUS_SET_VBR_CONSTRAINT: i32 = 4020;
+const OPUS_SET_LSB_DEPTH: i32 = 4036;
+const OPUS_BANDWIDTH_FULLBAND: i32 = 1105;
 const OPUS_SIGNAL_MUSIC: i32 = 3002;
 
 #[derive(Clone)]
@@ -83,13 +112,17 @@ impl OpusEnc {
         let p = unsafe { opus::opus_encoder_create(48000, 2, OPUS_APPLICATION_AUDIO, &mut err) };
         if p.is_null() || err != 0 { return Err(format!("opus_encoder_create failed ({err})")); }
         unsafe {
-            opus::opus_encoder_ctl(p, OPUS_SET_BITRATE, BITRATE);
+            opus::opus_encoder_ctl(p, OPUS_SET_BITRATE, cfg().bitrate);
             opus::opus_encoder_ctl(p, OPUS_SET_VBR, 1i32);
-            opus::opus_encoder_ctl(p, OPUS_SET_COMPLEXITY, 6i32);
+            opus::opus_encoder_ctl(p, OPUS_SET_COMPLEXITY, cfg().complexity);
+            opus::opus_encoder_ctl(p, OPUS_SET_MAX_BANDWIDTH, OPUS_BANDWIDTH_FULLBAND); // keep everything up to 20 kHz
+            opus::opus_encoder_ctl(p, OPUS_SET_LSB_DEPTH, 24i32);                       // our input is float, treat as 24-bit
+            if cfg().unconstrained_vbr { opus::opus_encoder_ctl(p, OPUS_SET_VBR_CONSTRAINT, 0i32); }
             opus::opus_encoder_ctl(p, OPUS_SET_SIGNAL, OPUS_SIGNAL_MUSIC);
         }
         Ok(Self(p))
     }
+    fn set_complexity(&mut self, c: i32) { unsafe { opus::opus_encoder_ctl(self.0, OPUS_SET_COMPLEXITY, c); } }
     fn encode(&mut self, pcm: &[f32], out: &mut [u8]) -> i32 {
         unsafe { opus::opus_encode_float(self.0, pcm.as_ptr(), FRAME_SAMPLES as i32, out.as_mut_ptr(), out.len() as i32) }
     }
@@ -145,6 +178,11 @@ struct Pipe {
     ctl: Arc<Control>,
     throttle: bool,
     stats: Stats,
+    cx: i32,        // current Opus complexity (adaptive)
+    tsbuf: Vec<f32>,   // scratch for the time-scale pre-stage
+    tempo: f64,        // media seconds per output second (speed*rate)
+    pos_frac: f64,
+    healthy: u32,   // consecutive frames with a full buffer
 }
 
 impl Pipe {
@@ -153,7 +191,7 @@ impl Pipe {
         let mut pkt = pkt;
         loop {
             if self.ctl.stop.load(Relaxed) { return false; }
-            let room = if self.throttle { self.tx.slots() > RING_FRAMES - TARGET_AHEAD } else { self.tx.slots() > 0 };
+            let room = if self.throttle { self.tx.slots() > RING_FRAMES - cfg().target_ahead } else { self.tx.slots() > 0 };
             if room {
                 match self.tx.push(pkt) {
                     Ok(()) => return true,
@@ -169,15 +207,40 @@ impl Pipe {
         p.data[..data.len()].copy_from_slice(data);
         self.stats.frames += 1;
         if passthrough { self.stats.passthrough_frames += 1; }
-        self.ctl.position_ms.fetch_add(20, Relaxed);
+        self.pos_frac += 20.0 * self.tempo;
+        let whole = self.pos_frac as u64;
+        self.pos_frac -= whole as f64;
+        self.ctl.position_ms.fetch_add(whole, Relaxed);
         self.push(p)
+    }
+
+    /// CPU-pressure feedback: buffer draining => cheaper encode; buffer full for a while => restore quality.
+    fn adapt(&mut self) {
+        if !self.throttle || !cfg().adaptive { return; }
+        let t = cfg().target_ahead;
+        let occ = RING_FRAMES - self.tx.slots();
+        if occ * 3 < t {
+            self.healthy = 0;
+            if self.cx > 1 { self.cx -= 1; self.enc.set_complexity(self.cx); }
+        } else if occ + 1 >= t {
+            self.healthy += 1;
+            if self.healthy >= 150 && self.cx < cfg().complexity { self.cx += 1; self.enc.set_complexity(self.cx); self.healthy = 0; }
+        }
     }
 
     fn identity(&self) -> bool { self.chain.lock().map(|c| c.is_identity()).unwrap_or(false) }
 
     /// feed stereo 48 kHz PCM; encodes as many whole 20 ms frames as available
     fn feed(&mut self, stereo48: &[f32]) -> bool {
-        self.acc.extend_from_slice(stereo48);
+        // variable-length pre-stage (speed / pitch / rate); bypassed when inactive
+        let mut tmp = std::mem::take(&mut self.tsbuf);
+        tmp.clear();
+        let used = match self.chain.lock() {
+            Ok(mut c) => { let u = c.timescale(stereo48, &mut tmp); self.tempo = c.tempo(); u }
+            Err(_) => false,
+        };
+        if used { self.acc.extend_from_slice(&tmp); } else { self.acc.extend_from_slice(stereo48); }
+        self.tsbuf = tmp;
         let n = FRAME_SAMPLES * 2;
         let mut off = 0;
         let mut ok = true;
@@ -185,6 +248,7 @@ impl Pipe {
             self.fbuf.copy_from_slice(&self.acc[off..off + n]);
             off += n;
             if let Ok(mut c) = self.chain.lock() { c.process(&mut self.fbuf); }
+            self.adapt();
             let mut out = [0u8; MAX_PACKET];
             let len = self.enc.encode(&self.fbuf, &mut out);
             if len > 0 && !self.emit(&out[..len as usize], false) { ok = false; break; }
@@ -267,7 +331,7 @@ fn run_inner(input: Input, chain: Arc<Mutex<FilterChain>>, tx: Producer<Packet>,
 
     let mut pipe = Pipe {
         chain, enc: OpusEnc::new()?, acc: Vec::with_capacity(FRAME_SAMPLES * 8), fbuf: [0.0; FRAME_SAMPLES * 2],
-        tx, ctl: ctl.clone(), throttle, stats: Stats::default(),
+        tx, ctl: ctl.clone(), throttle, stats: Stats::default(), cx: cfg().complexity, healthy: 0, tsbuf: Vec::new(), tempo: 1.0, pos_frac: 0.0,
     };
     pipe.stats.codec = if is_opus { "opus".into() } else { format!("{:?}", track.codec_params.codec) };
     pipe.stats.source_rate = track.codec_params.sample_rate.unwrap_or(0);
@@ -291,6 +355,7 @@ fn run_inner(input: Input, chain: Arc<Mutex<FilterChain>>, tx: Producer<Packet>,
             ctl.epoch.fetch_add(1, SeqCst);
             ctl.position_ms.store(s as u64, Relaxed);
             pipe.acc.clear();
+            if let Ok(mut c) = pipe.chain.lock() { c.reset_state(); }
             if let Some(r) = resamp.as_mut() { r.reset(); }
             if let Some(d) = sym_dec.as_mut() { d.reset(); }
         }
