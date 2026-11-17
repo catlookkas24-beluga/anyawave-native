@@ -42,6 +42,7 @@ pub struct Packet {
     pub epoch: u32,
     pub len: u16,
     pub passthrough: bool,
+    pub pos_ms: u64,             // media position of this packet (for playerUpdate)
     pub data: [u8; MAX_PACKET],
 }
 
@@ -53,7 +54,8 @@ pub struct Control {
     pub paused: AtomicBool,      // consumer side stops popping; kept here so one Arc carries all state
     pub seek_ms: AtomicI64,      // -1 = none
     pub epoch: AtomicU32,        // consumer drops packets with a different epoch
-    pub position_ms: AtomicU64,
+    pub position_ms: AtomicU64,  // producer-side position (ahead of playback by the buffer)
+    pub played_ms: AtomicU64,    // consumer-side position (what listeners actually hear)
     pub finished: AtomicBool,
     pub error: Mutex<Option<String>>,
 }
@@ -61,7 +63,7 @@ impl Control {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             stop: AtomicBool::new(false), paused: AtomicBool::new(false), seek_ms: AtomicI64::new(-1),
-            epoch: AtomicU32::new(0), position_ms: AtomicU64::new(0), finished: AtomicBool::new(false),
+            epoch: AtomicU32::new(0), position_ms: AtomicU64::new(0), played_ms: AtomicU64::new(0), finished: AtomicBool::new(false),
             error: Mutex::new(None),
         })
     }
@@ -163,7 +165,7 @@ impl Pipe {
     }
 
     fn emit(&mut self, data: &[u8], passthrough: bool) -> bool {
-        let mut p = Packet { epoch: self.ctl.epoch.load(Relaxed), len: data.len() as u16, passthrough, data: [0; MAX_PACKET] };
+        let mut p = Packet { epoch: self.ctl.epoch.load(Relaxed), len: data.len() as u16, passthrough, pos_ms: self.ctl.position_ms.load(Relaxed), data: [0; MAX_PACKET] };
         p.data[..data.len()].copy_from_slice(data);
         self.stats.frames += 1;
         if passthrough { self.stats.passthrough_frames += 1; }
