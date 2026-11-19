@@ -101,6 +101,7 @@ async fn main() {
         .route("/hifi/tiers", get(hifi_tiers))
         .route("/hifi/stream", get(hifi_stream))
         .route("/debug/probe", get(debug_probe))
+        .route("/debug/sc", get(debug_sc))
         .with_state(app);
     let port = std::env::var("PORT").unwrap_or("2333".into());
     let l = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}")).await.unwrap();
@@ -501,4 +502,15 @@ async fn hifi_stream(State(app): State<Arc<App>>, Query(q): Query<HashMap<String
         .header("Cache-Control", "no-store")
         .body(body)
         .unwrap()
+}
+
+// ------------------------------------------------------------------ SoundCloud diagnostics
+/// GET /debug/sc?key=<AW_PASSWORD>&url=<soundcloud link>  -> which step works / fails
+async fn debug_sc(State(app): State<Arc<App>>, Query(q): Query<HashMap<String, String>>) -> Json<Value> {
+    if q.get("key").map(|k| k.as_str()) != Some(app.password.as_str()) {
+        return Json(json!({"error": "add &key=<AW_PASSWORD>"}));
+    }
+    let Some(url) = q.get("url").cloned() else { return Json(json!({"error": "missing &url="})) };
+    Json(tokio::task::spawn_blocking(move || aw_engine::sources::soundcloud::diagnose(&url)).await
+        .unwrap_or_else(|e| json!({"error": e.to_string()})))
 }
