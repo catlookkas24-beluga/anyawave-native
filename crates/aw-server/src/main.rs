@@ -7,10 +7,12 @@
 use axum::{
     extract::{ws::{Message, WebSocket, WebSocketUpgrade}, Path, Query, State},
     http::{HeaderMap, StatusCode},
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     routing::{get, patch},
     Json, Router,
 };
+use axum::body::{Body, Bytes};
+use aw_engine::hifi::{self, Fmt, Opts, Tier};
 use aw_engine::{
     dsp::FilterChain,
     producer::{self, packet_ring, run, Control, Input},
@@ -96,6 +98,8 @@ async fn main() {
         .route("/v4/sessions/:sid", patch(patch_session))
         .route("/v4/sessions/:sid/players", get(list_players))
         .route("/v4/sessions/:sid/players/:gid", get(get_player).patch(update_player).delete(delete_player))
+        .route("/hifi/tiers", get(hifi_tiers))
+        .route("/hifi/stream", get(hifi_stream))
         .route("/debug/probe", get(debug_probe))
         .with_state(app);
     let port = std::env::var("PORT").unwrap_or("2333".into());
@@ -438,4 +442,63 @@ fn probe(url: String, secs: u64) -> Value {
         Ok(Err(e)) => json!({"ok":false,"error":e,"frames":frames}),
         Err(_) => json!({"ok":false,"error":"producer thread panicked"}),
     }
+}
+
+// ------------------------------------------------------------------ hi-fi output (HTTP, not Discord)
+struct ChanWriter(tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>);
+impl std::io::Write for ChanWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.blocking_send(Ok(Bytes::copy_from_slice(buf)))
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "client closed"))?;
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+}
+
+async fn hifi_tiers() -> Json<Value> {
+    Json(tokio::task::spawn_blocking(hifi::describe).await.unwrap_or_else(|e| json!({"error": e.to_string()})))
+}
+
+/// GET /hifi/stream?key=<AW_PASSWORD>&url=<audio url>&tier=efficient|high|lossless|hires
+///                 [&format=flac|alac|wav] [&t=<start seconds>] [&filters=<url-encoded filters JSON>]
+async fn hifi_stream(State(app): State<Arc<App>>, Query(q): Query<HashMap<String, String>>) -> Response {
+    if q.get("key").map(|k| k.as_str()) != Some(app.password.as_str()) {
+        return (StatusCode::UNAUTHORIZED, "add &key=<AW_PASSWORD>").into_response();
+    }
+    let Some(url) = q.get("url").cloned() else { return (StatusCode::BAD_REQUEST, "missing &url=").into_response() };
+    let tier = match q.get("tier").map(|s| s.as_str()).unwrap_or("lossless") {
+        "efficient" => Tier::Efficient, "high" => Tier::High, "lossless" => Tier::Lossless, "hires" => Tier::HiRes,
+        _ => return (StatusCode::BAD_REQUEST, "tier must be efficient|high|lossless|hires").into_response(),
+    };
+    let fmt = match q.get("format").map(|s| s.as_str()).unwrap_or("flac") {
+        "alac" => Fmt::Alac, "wav" => Fmt::Wav, _ => Fmt::Flac,
+    };
+    let start_ms = q.get("t").and_then(|s| s.parse::<f64>().ok()).map(|s| (s * 1000.0) as i64).unwrap_or(0);
+    let filters: Option<Value> = q.get("filters").and_then(|s| serde_json::from_str(s).ok());
+
+    let ffmpeg_ok = tokio::task::spawn_blocking(|| hifi::capabilities().ffmpeg).await.unwrap_or(false);
+    if !ffmpeg_ok { return (StatusCode::SERVICE_UNAVAILABLE, "ffmpeg is not installed on this server").into_response(); }
+    let (ct, label) = hifi::content_type(tier, fmt);
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(8);
+    let tx2 = tx.clone();
+    tokio::task::spawn_blocking(move || {
+        let configure: Option<Box<dyn Fn(&mut FilterChain) + Send>> = filters.map(|f| {
+            Box::new(move |c: &mut FilterChain| filters::apply(c, &f, 100)) as Box<dyn Fn(&mut FilterChain) + Send>
+        });
+        let opts = Opts { tier, fmt, start_ms, configure };
+        match hifi::stream(&url, opts, Box::new(ChanWriter(tx2.clone()))) {
+            Ok(i) => tracing::info!("hifi done: {}->{} Hz, {} ch, {} bytes, filtered={}", i.in_rate, i.out_rate, i.channels, i.bytes_out, i.filtered),
+            Err(e) => { tracing::warn!("hifi failed: {e}"); let _ = tx2.blocking_send(Err(std::io::Error::new(std::io::ErrorKind::Other, e))); }
+        }
+    });
+    drop(tx);
+    let body = Body::from_stream(futures_util::stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|item| (item, rx)) }));
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", ct)
+        .header("X-AW-Codec", label)
+        .header("Cache-Control", "no-store")
+        .body(body)
+        .unwrap()
 }
