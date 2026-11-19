@@ -1,4 +1,5 @@
 pub mod dsp;
+pub mod hifi;
 pub mod player;
 pub mod producer;
 pub mod scheduler;
