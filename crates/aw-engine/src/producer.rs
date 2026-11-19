@@ -274,15 +274,9 @@ fn open(input: &Input) -> Result<(Box<dyn MediaSource>, Hint), String> {
     let mut hint = Hint::new();
     match input {
         Input::Url(u) => {
-            let path = u.split('?').next().unwrap_or(u);
-            if let Some(e) = ext_of(path) { hint.with_extension(&e); }
-            let agent = ureq::AgentBuilder::new()
-                .timeout_connect(Duration::from_secs(10))
-                .timeout_read(Duration::from_secs(15))
-                .build();
-            let resp = agent.get(u).call().map_err(|e| format!("http: {e}"))?;
-            let rd = resp.into_reader();
-            Ok((Box::new(ReadOnlySource::new(rd)), hint))
+            let (src, ext) = crate::sources::open_url(u)?;
+            if let Some(e) = ext { hint.with_extension(&e); }
+            Ok((src, hint))
         }
         Input::File(p) => {
             if let Some(e) = p.to_str().and_then(ext_of) { hint.with_extension(&e); }
