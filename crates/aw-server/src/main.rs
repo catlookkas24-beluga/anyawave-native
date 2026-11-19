@@ -107,7 +107,7 @@ async fn main() {
 async fn info() -> Json<Value> {
     Json(json!({"version":{"semver":"4.0.0","major":4,"minor":0,"patch":0},
         "buildTime":0,"git":{"branch":"main","commit":"dev","commitTime":0},"jvm":"n/a","lavaplayer":"n/a",
-        "sourceManagers":["http"],"filters":["volume","equalizer","karaoke","timescale","tremolo","vibrato","distortion","rotation","channelMix","lowPass","preamp","parametricEq","stereo","echo","reverb","compressor","limiter","preset"],"plugins":[]}))
+        "sourceManagers":["http","soundcloud"],"filters":["volume","equalizer","karaoke","timescale","tremolo","vibrato","distortion","rotation","channelMix","lowPass","preamp","parametricEq","stereo","echo","reverb","compressor","limiter","preset"],"plugins":[]}))
 }
 
 fn stats_json(app: &App) -> Value {
@@ -140,14 +140,45 @@ fn make_track(info: Value, user_data: Value) -> Value {
     json!({"encoded": B64.encode(info.to_string()), "info": info, "pluginInfo": {}, "userData": user_data})
 }
 
+fn sc_info(t: &aw_engine::sources::soundcloud::ScTrack) -> Value {
+    let title = if t.preview_only { format!("{} (30 s preview)", t.title) } else { t.title.clone() };
+    json!({"identifier": t.id.to_string(), "isSeekable": true, "author": t.author, "length": t.duration_ms,
+           "isStream": false, "position": 0, "title": title,
+           "uri": t.permalink, "artworkUrl": t.artwork, "isrc": null, "sourceName": "soundcloud"})
+}
+
+fn load_error(msg: String) -> Value { json!({"loadType":"error","data":{"message":msg,"severity":"common","cause":""}}) }
+
+/// blocking (network): runs on the blocking pool
+fn load_identifier(id: &str) -> Value {
+    use aw_engine::sources::soundcloud as sc;
+    if let Some(q) = id.strip_prefix("scsearch:") {
+        return match sc::search(q.trim(), 15) {
+            Ok(v) if v.is_empty() => json!({"loadType":"empty","data":{}}),
+            Ok(v) => json!({"loadType":"search","data": v.iter().map(|t| make_track(sc_info(t), json!({}))).collect::<Vec<_>>()}),
+            Err(e) => load_error(e),
+        };
+    }
+    if sc::is_soundcloud(id) {
+        return match sc::resolve(id) {
+            Ok(sc::Resolved::Track(t)) => json!({"loadType":"track","data": make_track(sc_info(&t), json!({}))}),
+            Ok(sc::Resolved::Playlist { name, tracks }) => json!({"loadType":"playlist","data":{
+                "info":{"name":name,"selectedTrack":-1},"pluginInfo":{},
+                "tracks": tracks.iter().map(|t| make_track(sc_info(t), json!({}))).collect::<Vec<_>>()}}),
+            Err(e) => load_error(e),
+        };
+    }
+    if id.starts_with("http://") || id.starts_with("https://") {
+        return json!({"loadType":"track","data": make_track(make_info(id), json!({}))});
+    }
+    json!({"loadType":"empty","data":{}})   // ytsearch: etc. are not implemented
+}
+
 async fn load_tracks(State(app): State<Arc<App>>, h: HeaderMap, Query(q): Query<HashMap<String, String>>) -> (StatusCode, Json<Value>) {
     if !authed(&app, &h) { return unauthorized(); }
     let id = q.get("identifier").cloned().unwrap_or_default();
-    if id.starts_with("http://") || id.starts_with("https://") {
-        (StatusCode::OK, Json(json!({"loadType":"track","data": make_track(make_info(&id), json!({}))})))
-    } else {
-        (StatusCode::OK, Json(json!({"loadType":"empty","data":{}})))   // search sources (yt/sc) not implemented yet
-    }
+    let v = tokio::task::spawn_blocking(move || load_identifier(&id)).await.unwrap_or_else(|e| load_error(e.to_string()));
+    (StatusCode::OK, Json(v))
 }
 
 async fn decode_track(State(app): State<Arc<App>>, h: HeaderMap, Query(q): Query<HashMap<String, String>>) -> (StatusCode, Json<Value>) {
