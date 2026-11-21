@@ -56,7 +56,10 @@ pub fn connect(p: VoiceParams, shard: Sender<Box<dyn Tickable>>, slot: Arc<Playe
         let r = run(p, shard, slot, events.clone(), hh.clone()).await;
         hh.closed.store(true, Relaxed);
         hh.connected.store(false, Relaxed);
-        if let Err((code, reason)) = r { let _ = events.send(VoiceEvent::Closed { code, reason }); }
+        if let Err((code, reason)) = r {
+            tracing::warn!("voice closed: code={code} reason={reason}");
+            let _ = events.send(VoiceEvent::Closed { code, reason });
+        }
     });
     h
 }
@@ -82,6 +85,7 @@ enum Ev { Stop, Beat, Msg(Option<Result<Message, tokio_tungstenite::tungstenite:
 async fn run(p: VoiceParams, shard: Sender<Box<dyn Tickable>>, slot: Arc<PlayerSlot>, events: UnboundedSender<VoiceEvent>, h: VoiceHandle) -> Result<(), Fail> {
     let host = p.endpoint.trim_start_matches("wss://").split(':').next().unwrap_or("").to_string();
     let (ws, _) = connect_async(format!("wss://{host}/?v=8")).await.map_err(|e| (1006u16, format!("connect: {e}")))?;
+    tracing::info!("voice[{}] websocket connected to {host}", p.guild_id);
     let (tx, mut rx) = ws.split();
     let notify = h.notify.clone();
     let dave = Arc::new(Mutex::new(DaveCtx::new(p.user_id, p.channel_id)));
@@ -175,6 +179,7 @@ impl Conn {
                     s.set_nonblocking(true)?;
                     Ok((s, ip, port))
                 }).await.map_err(|e| (1011u16, e.to_string()))?.map_err(|e| (1011u16, format!("udp: {e}")))?;
+                tracing::info!("voice[{}] ready: ssrc={} mode={mode} external={my_ip}:{my_port}", self.p.guild_id, self.ssrc);
                 self.sock = Some(sock);
                 self.send_json(select_protocol(&my_ip, my_port, mode)).await?;
             }
@@ -186,6 +191,7 @@ impl Conn {
                 let transport = Transport::new(&mode, &key).ok_or_else(|| (1002u16, format!("unsupported mode {mode}")))?;
                 let ver = d["dave_protocol_version"].as_u64().unwrap_or(0) as u16;
 
+                tracing::info!("voice[{}] session description: mode={mode} dave_protocol_version={ver}", self.p.guild_id);
                 self.send_json(speaking(self.ssrc)).await?;
                 let kp = { let mut g = self.dave.lock().map_err(|_| (1011u16, "dave lock".to_string()))?; g.init(ver) };
                 if let Some(kp) = kp.map_err(|e| (1011u16, e))? { self.send_bin(OP_MLS_KEY_PACKAGE, &kp).await?; }
@@ -241,6 +247,7 @@ impl Conn {
                 let r = { let mut d = self.dave.lock().map_err(|_| (1011u16, "dave lock".to_string()))?; d.process_proposals(pl[0], &pl[1..]) };
                 match r {
                     Ok(Some(cw)) => {
+                        tracing::info!("voice[{}] dave: sending commit{}", self.p.guild_id, if cw.welcome.is_some() { "+welcome" } else { "" });
                         let mut out = cw.commit;
                         if let Some(w) = cw.welcome { out.extend_from_slice(&w); }
                         self.send_bin(OP_MLS_COMMIT_WELCOME, &out).await?;
@@ -258,7 +265,11 @@ impl Conn {
                     (r, d.version)
                 };
                 match r {
-                    Ok(()) => { self.pending = Some((id, ver)); self.send_json(transition_ready(id)).await?; }
+                    Ok(()) => {
+                        tracing::info!("voice[{}] dave: op{op} processed, transition {id} ready (v{ver})", self.p.guild_id);
+                        self.pending = Some((id, ver));
+                        self.send_json(transition_ready(id)).await?;
+                    }
                     Err(e) => { tracing::warn!("dave commit/welcome: {e}"); self.recover(Some(id)).await?; }
                 }
             }
