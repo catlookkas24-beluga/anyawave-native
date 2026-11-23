@@ -9,7 +9,11 @@
 //! The decoder keeps the SOURCE sample rate / bit depth (no forced 48 kHz). With no filter active the samples are
 //! passed untouched (f32 holds every 24-bit integer exactly), so lossless tiers are bit-perfect w.r.t. the source.
 //! Encoding is done by an ffmpeg subprocess fed with raw f32le on stdin.
+//!
+//! MQA: sources are checked for the MQA sync word (see `mqa.rs`). Detection only - an MQA file is passed through as
+//! the ordinary 24-bit "core" it contains; there is no MQA unfold/render.
 use crate::dsp::FilterChain;
+use crate::mqa;
 use crate::sources::open_url;
 use serde_json::{json, Value};
 use std::io::{Read, Write};
@@ -113,7 +117,15 @@ pub struct Opts {
 }
 
 #[derive(Debug, Clone)]
-pub struct Info { pub in_rate: u32, pub out_rate: u32, pub channels: usize, pub bytes_out: u64, pub filtered: bool }
+pub struct Info {
+    pub in_rate: u32,
+    pub out_rate: u32,
+    pub channels: usize,
+    pub bytes_out: u64,
+    pub filtered: bool,
+    /// MQA sync-word scan of the source (None when the source was not stereo / was not scanned)
+    pub mqa: Option<mqa::Report>,
+}
 
 type Block = (Vec<f32>, u32, usize);
 
@@ -198,6 +210,14 @@ pub fn stream(url: &str, opts: Opts, sink: Box<dyn Write + Send>) -> Result<Info
     let ch_out = if filtered { 2 } else { ch.clamp(1, 2) };
     let plan = plan(opts.tier, opts.fmt, rate)?;
 
+    // MQA sync-word scan on the RAW decoded samples (before any filter). Only meaningful for stereo sources.
+    // Skipped when seeking (the sync word is near the start of the file). Finishes as soon as it has an answer.
+    let mut det = (ch == 2 && opts.start_ms <= 0).then(mqa::Detector::new);
+    let mut mqa_report: Option<mqa::Report> = None;
+    if let Some(d) = det.as_mut() {
+        if d.push(&first, ch) { mqa_report = det.take().map(|d| d.finish()); }
+    }
+
     let mut args = s(&["-hide_banner", "-loglevel", "error", "-f", "f32le"]);
     args.extend(s(&["-ar", &rate.to_string(), "-ac", &ch_out.to_string(), "-i", "pipe:0"]));
     args.extend(plan.args.iter().cloned());
@@ -239,7 +259,12 @@ pub fn stream(url: &str, opts: Opts, sink: Box<dyn Write + Send>) -> Result<Info
         let samples = match pending.take() {
             Some(x) => x,
             None => match next_block(&mut format, &mut dec, track_id, &mut sbuf) {
-                Ok(Some((x, _, _))) => x,
+                Ok(Some((x, _, _))) => {
+                    if let Some(d) = det.as_mut() {
+                        if d.push(&x, ch) { mqa_report = det.take().map(|d| d.finish()); }
+                    }
+                    x
+                }
                 Ok(None) => break,
                 Err(e) => { failure = Some(e); break; }
             },
@@ -257,7 +282,45 @@ pub fn stream(url: &str, opts: Opts, sink: Box<dyn Write + Send>) -> Result<Info
     let errtxt = err_thread.and_then(|t| t.join().ok()).unwrap_or_default();
     if let Some(e) = failure { return Err(e); }
     if ffmpeg_died && !dead.load(Relaxed) { return Err(format!("ffmpeg stopped: {}", errtxt.trim())); }
-    Ok(Info { in_rate: rate, out_rate: plan.out_rate, channels: ch_out, bytes_out: total, filtered })
+    // short tracks: the scan may not have reached a verdict yet - report what it saw
+    let mqa_report = mqa_report.or_else(|| det.take().map(|d| d.finish()));
+    Ok(Info { in_rate: rate, out_rate: plan.out_rate, channels: ch_out, bytes_out: total, filtered, mqa: mqa_report })
+}
+
+/// Decode just enough of `url` (at most ~30 s of audio) to look for the MQA sync word. Blocking.
+/// Use for a cheap "is this file MQA?" check without encoding anything.
+pub fn probe_mqa(url: &str) -> Result<mqa::Report, String> {
+    let (src, ext) = open_url(url)?;
+    let mut hint = Hint::new();
+    if let Some(e) = ext { hint.with_extension(&e); }
+    let mss = MediaSourceStream::new(src, MediaSourceStreamOptions::default());
+    let probed = symphonia::default::get_probe()
+        .format(&hint, mss, &FormatOptions::default(), &MetadataOptions::default())
+        .map_err(|e| format!("probe: {e}"))?;
+    let mut format = probed.format;
+    let track = format.tracks().iter().find(|t| t.codec_params.codec != CODEC_TYPE_NULL).ok_or("no audio track")?.clone();
+    let mut dec = symphonia::default::get_codecs().make(&track.codec_params, &DecoderOptions::default())
+        .map_err(|e| format!("decoder: {e}"))?;
+    let track_id = track.id;
+    let mut sbuf: Option<SampleBuffer<f32>> = None;
+    let mut det = mqa::Detector::new();
+    while let Some((x, _rate, ch)) = next_block(&mut format, &mut dec, track_id, &mut sbuf)? {
+        if det.push(&x, ch) { break; }
+    }
+    Ok(det.finish())
+}
+
+/// JSON view of a Report for the HTTP API
+pub fn mqa_json(r: &mqa::Report) -> Value {
+    json!({
+        "mqa": r.is_mqa,
+        "stereo": r.stereo,
+        "syncBit": r.bit_pos,
+        "syncFrame": r.sync_frame,
+        "rawAfterSync": r.raw_after_sync.map(|v| format!("{v:#010x}")),
+        "framesScanned": r.frames_scanned,
+        "note": "detection only: MQA unfold/render is not implemented; the file plays as its normal 24-bit core"
+    })
 }
 
 /// capability report for GET /hifi/tiers
@@ -272,10 +335,12 @@ pub fn describe() -> Value {
         {"id":"lossless","appleName":"Lossless (ALAC up to 24-bit/48 kHz)","output": l(Tier::Lossless, Fmt::Auto),"formats":["flac","alac","wav"],"bitPerfect":"yes when no filter is active and the source is lossless"},
         {"id":"hires","appleName":"Hi-Res Lossless (ALAC up to 24-bit/192 kHz)","output": l(Tier::HiRes, Fmt::Auto),"formats":["flac","alac","wav"],"bitPerfect":"yes when no filter is active and the source is lossless"}
       ],
+      "mqa": {"detect": true, "decode": false},
       "notes": [
         "Not carried by Discord voice (Opus only); this is the web/HTTP output.",
         "A lossy source (MP3, SoundCloud, ...) cannot become better than it is; lossless tiers only preserve what the source has.",
-        "Opus sources are not supported on this path yet."
+        "Opus sources are not supported on this path yet.",
+        "MQA: sources are scanned for the MQA sync word and reported; there is no MQA unfold, the file is passed through as its 24-bit core."
       ]
     })
 }
