@@ -1,6 +1,7 @@
 //! Lavalink v4-compatible server.
 //!   GET    /v4/websocket                      (Authorization, User-Id, Client-Name)
-//!   PATCH  /v4/sessions/{sid}/players/{gid}   {track{encoded|identifier}, position, volume, paused, filters, voice{...}}
+//!   PATCH  /v4/sessions/{sid}/players/{gid}   {track{encoded|identifier}, position, volume, paused, filters, voice{...},
+//!                                              crossfade{durationMs, mode}, nextTrack{encoded}|null}   (last two are AnyaWave extras)
 //!   GET    /v4/sessions/{sid}/players[/{gid}] DELETE /v4/sessions/{sid}/players/{gid}
 //!   GET    /v4/loadtracks?identifier=<http(s) audio url>   GET /v4/decodetrack?encodedTrack=
 //!   GET    /v4/info  /v4/stats  /version      GET /debug/probe?url=&secs=&key=
@@ -32,6 +33,7 @@ use std::{
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 mod filters;
+mod xfade;
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -70,6 +72,11 @@ struct Player {
     paused: bool,
     filters: Value,
     vtx: UnboundedSender<VoiceEvent>,
+    // crossfade
+    next_track: Option<Value>,   // queued track (sent to the producer via Control::set_next)
+    next_manual: bool,           // the queued track comes from a "replace" request (skip), not from nextTrack
+    xfade_ms: u32,               // 0 = off
+    xfade_smart: bool,
 }
 
 fn now_ms() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0) }
@@ -112,7 +119,8 @@ async fn main() {
 async fn info() -> Json<Value> {
     Json(json!({"version":{"semver":"4.0.0","major":4,"minor":0,"patch":0},
         "buildTime":0,"git":{"branch":"main","commit":"dev","commitTime":0},"jvm":"n/a","lavaplayer":"n/a",
-        "sourceManagers":["http","soundcloud"],"filters":["volume","equalizer","karaoke","timescale","tremolo","vibrato","distortion","rotation","channelMix","lowPass","preamp","parametricEq","stereo","echo","reverb","compressor","limiter","preset"],"plugins":[]}))
+        "sourceManagers":["http","soundcloud"],"filters":["volume","equalizer","karaoke","timescale","tremolo","vibrato","distortion","rotation","channelMix","lowPass","preamp","parametricEq","stereo","echo","reverb","compressor","limiter","preset"],"plugins":[],
+        "features":{"crossfade":true,"gapless":true}}))
 }
 
 fn stats_json(app: &App) -> Value {
@@ -207,7 +215,8 @@ fn player_json(p: &Player) -> Value {
     let vi = p.voice_info.clone().unwrap_or(json!({}));
     json!({"guildId":p.gid.to_string(),"track":p.track,"volume":p.volume,"paused":p.paused,
         "state":{"time":now_ms(),"position":pos,"connected":connected,"ping":ping},
-        "voice":{"token":vi["token"],"endpoint":vi["endpoint"],"sessionId":vi["sessionId"]},"filters":p.filters})
+        "voice":{"token":vi["token"],"endpoint":vi["endpoint"],"sessionId":vi["sessionId"]},"filters":p.filters,
+        "crossfade":{"durationMs":p.xfade_ms,"mode":xfade::mode_name(p)},"nextTrack":p.next_track})
 }
 
 fn new_player(sess: &Arc<Session>, gid: u64) -> Player {
@@ -215,7 +224,8 @@ fn new_player(sess: &Arc<Session>, gid: u64) -> Player {
     spawn_forwarder(sess.clone(), gid.to_string(), vrx);
     Player { gid, voice: None, voice_info: None, slot: Arc::new(PlayerSlot::default()),
         chain: Arc::new(Mutex::new(FilterChain::new(48000))), ctl: None, track: None, volume: 100, paused: false,
-        filters: json!({}), vtx }
+        filters: json!({}), vtx,
+        next_track: None, next_manual: false, xfade_ms: xfade::default_ms(), xfade_smart: xfade::default_smart() }
 }
 
 /// voice-thread events -> Lavalink WebSocket events
@@ -225,7 +235,7 @@ fn spawn_forwarder(sess: Arc<Session>, gid: String, mut vrx: UnboundedReceiver<V
             match ev {
                 VoiceEvent::Connected => {}
                 VoiceEvent::TrackEnded { error } => {
-                    let track = { let mut ps = sess.players.lock().unwrap(); ps.get_mut(&gid).and_then(|p| { p.ctl = None; p.track.take() }) };
+                    let track = { let mut ps = sess.players.lock().unwrap(); ps.get_mut(&gid).and_then(|p| { p.ctl = None; p.next_track = None; p.next_manual = false; p.track.take() }) };
                     if let Some(t) = track {
                         let reason = if error.is_some() { "loadFailed" } else { "finished" };
                         if let Some(e) = &error {
@@ -246,16 +256,19 @@ fn spawn_forwarder(sess: Arc<Session>, gid: String, mut vrx: UnboundedReceiver<V
 fn stop_track(p: &mut Player, sess: &Session, reason: &str) {
     if let Some(c) = p.ctl.take() { c.stop.store(true, Relaxed); }
     *p.slot.inner.lock().unwrap() = None;
+    p.next_track = None;
+    p.next_manual = false;
     if let Some(t) = p.track.take() {
         emit(sess, json!({"op":"event","type":"TrackEndEvent","guildId":p.gid.to_string(),"track":t,"reason":reason}));
     }
 }
 
-fn start_track(p: &mut Player, sess: &Session, url: String, track: Value, start_ms: i64) {
+fn start_track(p: &mut Player, sess: &Arc<Session>, url: String, track: Value, start_ms: i64) {
     stop_track(p, sess, "replaced");
     let (tx, rx) = packet_ring();
     let ctl = Control::new();
     ctl.paused.store(p.paused, Relaxed);
+    xfade::attach(p, sess, &ctl, &track);   // crossfade settings + hand-off events, BEFORE the producer starts
     producer::spawn(Input::Url(url), p.chain.clone(), tx, ctl.clone(), start_ms);
     *p.slot.inner.lock().unwrap() = Some(Active { cons: rx, ctl: ctl.clone() });
     p.ctl = Some(ctl);
@@ -323,6 +336,10 @@ async fn update_player(State(app): State<Arc<App>>, h: HeaderMap, Path((sid, gid
     if let Some(f) = body.get("filters") { if f.is_object() { p.filters = f.clone(); } }
     if body.get("volume").is_some() || body.get("filters").is_some() { refresh_chain(p); }
     if let Some(b) = body["paused"].as_bool() { p.paused = b; if let Some(c) = &p.ctl { c.paused.store(b, Relaxed); } }
+    // 2b) crossfade settings (before the track so a track in this request already uses them)
+    if let Some(c) = body.get("crossfade") {
+        if let Some((ms, smart)) = xfade::parse(c) { p.xfade_ms = ms; p.xfade_smart = smart; xfade::apply(p); }
+    }
 
     // 3) track
     let mut started = false;
@@ -336,7 +353,9 @@ async fn update_player(State(app): State<Arc<App>>, h: HeaderMap, Path((sid, gid
                     match B64.decode(enc.as_bytes()).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()) {
                         Some(info) => {
                             let url = info["uri"].as_str().unwrap_or("").to_string();
-                            start_track(p, &sess, url, make_track(info, user_data), start_ms);
+                            let tv = make_track(info, user_data);
+                            // playing + crossfade on => fade into it; otherwise hard replace as before
+                            if !xfade::try_crossfade(p, &tv, start_ms) { start_track(p, &sess, url, tv, start_ms); }
                             started = true;
                         }
                         None => return (StatusCode::BAD_REQUEST, Json(json!({"error":"invalid track.encoded"}))),
@@ -346,13 +365,16 @@ async fn update_player(State(app): State<Arc<App>>, h: HeaderMap, Path((sid, gid
             _ => {
                 if let Some(id) = t["identifier"].as_str() {
                     if !(no_replace && p.track.is_some()) {
-                        start_track(p, &sess, id.to_string(), make_track(make_info(id), user_data), start_ms);
+                        let tv = make_track(make_info(id), user_data);
+                        if !xfade::try_crossfade(p, &tv, start_ms) { start_track(p, &sess, id.to_string(), tv, start_ms); }
                         started = true;
                     }
                 }
             }
         }
     }
+    // 3b) queue / clear the track that follows the current one (after `track`, which clears the queue)
+    if body.get("nextTrack").is_some() { xfade::queue_next(p, &body["nextTrack"]); }
     // 4) seek (only if no new track was started in this request)
     if !started {
         if let (Some(pos), Some(c)) = (body["position"].as_i64(), &p.ctl) { c.seek_ms.store(pos.max(0), Relaxed); }
