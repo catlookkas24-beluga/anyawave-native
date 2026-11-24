@@ -1,36 +1,17 @@
 # AnyaWave Native (Rust + C++)
+# Update summary 24/11/26
 
-Lavalink-v4-compatible audio server. **Status: design + uncompiled skeleton.**
-(Written in a sandbox with no cargo / no network: nothing here has been built or benchmarked.)
+# 1.DAVE (E2EE) is done, but untested
 
-## Goals -> how each is met
-| Goal | Mechanism |
-|---|---|
-| Many rooms | Sharded tick threads (<=4), NOT one thread per guild. Players are plain structs in a shard. |
-| Low resource | No GC/JVM. mimalloc. Opus **passthrough** when no filter + Opus source. Reused buffers on hot path. sendmmsg batching. |
-| Clear sound | f32 pipeline, soxr/rubato resample, libopus 96-128 kbps VBR complexity 5-6, clip guard. |
-| No stutter | Producer/consumer split: decode+encode run ahead into an SPSC ring (~300 ms); tick thread only pops/encrypts/sends. Absolute-deadline 20 ms clock (no drift), SCHED_FIFO if allowed. Underrun => RTP ts/seq still advance. |
-| DAVE | Voice gateway v8 + `max_dave_protocol_version`, MLS ops 21-31, Discord libdave (C++) behind a tiny C ABI. Passthrough until first epoch is ready; never blocks audio. |
+	•	Upgraded davey from 0.1 to 0.2. Version 0.1 switched keys immediately after a commit/welcome, which violates the protocol (it has to wait for op22), so audio could break up during epoch changes.
+	•	Rewrote dave.rs to use prepare_transition / execute_transition.
+	•	connection.rs: fixed the op21–31 ordering, added handling for op11/op13, removed the misplaced ready message in op24, and a failed commit now sends op31 and restarts the handshake.
+	•	gateway.rs: added opcodes 11 and 13.
 
-## Layout
-- `crates/aw-engine`  scheduler, ring, producer pipeline, FFI to `cpp/dsp.cpp`
-- `crates/aw-voice`   gateway v8, DAVE state machine, RTP, AEAD transport crypto, UDP
-- `crates/aw-server`  Lavalink v4 REST + WebSocket (axum)
-- `cpp/dsp.cpp`       filters (volume, 15-band EQ, tremolo done; timescale/karaoke/rotation TODO)
-- `cpp/dave_bridge.*` C ABI over libdave. **Only partly implemented; libdave symbol names marked VERIFY.**
+# 2.Password system that never stores plaintext
 
-## Per-tick data path (every 20 ms per player)
-ring.pop(opus) -> libdave encrypt (E2EE) -> RTP header -> AES-256-GCM / XChaCha20 (rtpsize) -> batch -> sendmmsg
-
-## Things you must verify before trusting it
-1. libdave API names/signatures: pin a release tag as `third_party/libdave` and fix `dave_bridge.cpp`.
-2. Binary voice-frame layout and nonce counter endianness vs current Discord voice docs.
-3. Lavaplayer track-blob (base64) encode/decode for client compatibility.
-4. Sources: YouTube needs a cipher/poToken solution (sidecar or plugin); HTTP/local/SoundCloud are easy.
-
-## Roadmap
-1. M1: one guild, HTTP source, Opus encode, transport crypto, no DAVE -> hear audio.
-2. M2: DAVE handshake against a real voice channel.
-3. M3: shards + sendmmsg + ring tuning; load test 500+ players, track `frameStats.deficit`.
-4. M4: filters (timescale first), resume, plugin-style SourceManager.
-5. M5: metrics, fuzz the binary parsers.
+	•	New file auth.rs: the server stores only HMAC-SHA256(pepper, password) and compares it in constant time.
+	•	Removed the youshallnotpass default. If the variables aren't set, the server refuses to start.
+	•	Passwords must be at least 20 characters.
+	•	Generate the value with aw-server --make-digest.
+	•	The full main.rs now uses this system, including /hifi/stream and /debug/*.
