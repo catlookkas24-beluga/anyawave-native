@@ -10,6 +10,8 @@ pub const OP_SESSION_DESC: u8 = 4;
 pub const OP_SPEAKING: u8 = 5;
 pub const OP_HEARTBEAT_ACK: u8 = 6;
 pub const OP_HELLO: u8 = 8;
+pub const OP_CLIENTS_CONNECT: u8 = 11;   // {"user_ids":["..."]}
+pub const OP_CLIENT_DISCONNECT: u8 = 13; // {"user_id":"..."}
 // DAVE (JSON)
 pub const OP_DAVE_PREPARE_TRANSITION: u8 = 21;
 pub const OP_DAVE_EXECUTE_TRANSITION: u8 = 22;
@@ -22,7 +24,7 @@ pub const OP_MLS_PROPOSALS: u8 = 27;
 pub const OP_MLS_COMMIT_WELCOME: u8 = 28;
 pub const OP_MLS_ANNOUNCE_COMMIT: u8 = 29;
 pub const OP_MLS_WELCOME: u8 = 30;
-pub const OP_MLS_INVALID_COMMIT: u8 = 31;
+pub const OP_MLS_INVALID_COMMIT: u8 = 31; // sent by the client as JSON
 
 pub const MAX_DAVE_VERSION: u16 = 1;
 

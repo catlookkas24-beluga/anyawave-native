@@ -77,7 +77,6 @@ struct Conn {
     hb_sent: Option<Instant>,
     hb_ms: Option<u64>,
     dave: Arc<Mutex<DaveCtx>>,
-    pending: Option<(u16, u16)>, // (transition_id, protocol_version)
 }
 
 enum Ev { Stop, Beat, Msg(Option<Result<Message, tokio_tungstenite::tungstenite::Error>>) }
@@ -89,7 +88,7 @@ async fn run(p: VoiceParams, shard: Sender<Box<dyn Tickable>>, slot: Arc<PlayerS
     let (tx, mut rx) = ws.split();
     let notify = h.notify.clone();
     let dave = Arc::new(Mutex::new(DaveCtx::new(p.user_id, p.channel_id)));
-    let mut conn = Conn { tx, p: p.clone(), shard, slot, events, h, seq: -1, ssrc: 0, sock: None, hb_sent: None, hb_ms: None, dave, pending: None };
+    let mut conn = Conn { tx, p: p.clone(), shard, slot, events, h, seq: -1, ssrc: 0, sock: None, hb_sent: None, hb_ms: None, dave };
     conn.send_json(identify(p.guild_id, p.user_id, &p.session_id, &p.token)).await?;
 
     let mut hb: Option<tokio::time::Interval> = None;
@@ -136,13 +135,25 @@ impl Conn {
         self.send_json(json!({"op":3,"d":{"t":t,"seq_ack":self.seq}})).await
     }
 
-    fn execute(&mut self, id: u16) {
-        if let Some((pid, ver)) = self.pending {
-            if pid == id {
-                self.pending = None;
-                if let Ok(mut d) = self.dave.lock() { d.passthrough = ver == 0; }
-            }
+    /// Prepare transition `id` -> `ver` (after a commit/welcome, or op 21).
+    /// id 0 = execute immediately and send no ready; otherwise tell the gateway we are ready (op 23)
+    /// and wait for op 22 to actually switch keys.
+    async fn begin_transition(&mut self, id: u16, ver: u16) -> Result<(), Fail> {
+        let r = { let mut d = self.dave.lock().map_err(|_| (1011u16, "dave lock".to_string()))?; d.prepare_transition(id, ver) };
+        if let Err(e) = r {
+            tracing::warn!("voice[{}] dave: prepare_transition({id}, v{ver}) failed: {e}", self.p.guild_id);
+            return self.recover(Some(id)).await;
         }
+        if id == 0 {
+            let r = { let mut d = self.dave.lock().map_err(|_| (1011u16, "dave lock".to_string()))?; d.execute_transition(0) };
+            match r {
+                Ok(_) => tracing::info!("voice[{}] dave: initial transition executed (v{ver})", self.p.guild_id),
+                Err(e) => tracing::debug!("voice[{}] dave: execute_transition(0): {e}", self.p.guild_id),
+            }
+        } else {
+            self.send_json(transition_ready(id)).await?;
+        }
+        Ok(())
     }
 
     /// unprocessable commit/welcome: tell the gateway, reset local group, send a fresh key package
@@ -205,26 +216,38 @@ impl Conn {
                 self.h.connected.store(true, Relaxed);
                 let _ = self.events.send(VoiceEvent::Connected);
             }
+            OP_CLIENTS_CONNECT => {
+                let ids: Vec<u64> = d["user_ids"].as_array()
+                    .map(|a| a.iter().filter_map(|x| x.as_str().and_then(|s| s.parse().ok())).collect()).unwrap_or_default();
+                if let Ok(mut g) = self.dave.lock() { g.add_users(&ids); }
+            }
+            OP_CLIENT_DISCONNECT => {
+                if let Some(u) = d["user_id"].as_str().and_then(|s| s.parse::<u64>().ok()) {
+                    if let Ok(mut g) = self.dave.lock() { g.remove_user(u); }
+                }
+            }
             OP_DAVE_PREPARE_TRANSITION => {
                 let id = d["transition_id"].as_u64().unwrap_or(0) as u16;
                 let ver = d["protocol_version"].as_u64().unwrap_or(0) as u16;
-                self.pending = Some((id, ver));
-                if id == 0 { self.execute(0); } else { self.send_json(transition_ready(id)).await?; }
+                self.begin_transition(id, ver).await?;
             }
             OP_DAVE_EXECUTE_TRANSITION => {
                 let id = d["transition_id"].as_u64().unwrap_or(0) as u16;
-                self.execute(id);
+                let r = { let mut g = self.dave.lock().map_err(|_| (1011u16, "dave lock".to_string()))?; g.execute_transition(id) };
+                match r {
+                    Ok(true) => tracing::info!("voice[{}] dave: transition {id} executed", self.p.guild_id),
+                    Ok(false) => tracing::debug!("voice[{}] dave: execute {id}: nothing pending", self.p.guild_id),
+                    Err(e) => tracing::warn!("voice[{}] dave: execute_transition({id}) failed: {e}", self.p.guild_id),
+                }
             }
             OP_DAVE_PREPARE_EPOCH => {
+                // epoch == 1 => the MLS group is (re)created from scratch: new key package.
+                // Other epochs are informational; the commit/welcome that follows carries the transition id.
                 let ver = d["protocol_version"].as_u64().unwrap_or(0) as u16;
                 let epoch = d["epoch"].as_u64().unwrap_or(0);
-                let id = d["transition_id"].as_u64().unwrap_or(0) as u16;
                 if epoch == 1 && ver > 0 {
                     let kp = { let mut g = self.dave.lock().map_err(|_| (1011u16, "dave lock".to_string()))?; g.init(ver) };
                     if let Some(kp) = kp.map_err(|e| (1011u16, e))? { self.send_bin(OP_MLS_KEY_PACKAGE, &kp).await?; }
-                } else if id != 0 {
-                    self.pending = Some((id, ver));
-                    self.send_json(transition_ready(id)).await?;
                 }
             }
             _ => {}
@@ -261,15 +284,15 @@ impl Conn {
                 let id = u16::from_be_bytes([pl[0], pl[1]]);
                 let (r, ver) = {
                     let mut d = self.dave.lock().map_err(|_| (1011u16, "dave lock".to_string()))?;
-                    let r = if op == OP_MLS_ANNOUNCE_COMMIT { d.process_commit(&pl[2..]) } else { d.process_welcome(&pl[2..]) };
+                    let r = if op == OP_MLS_ANNOUNCE_COMMIT { d.process_commit(&pl[2..]) } else { d.process_welcome(&pl[2..]).map(|_| true) };
                     (r, d.version)
                 };
                 match r {
-                    Ok(()) => {
-                        tracing::info!("voice[{}] dave: op{op} processed, transition {id} ready (v{ver})", self.p.guild_id);
-                        self.pending = Some((id, ver));
-                        self.send_json(transition_ready(id)).await?;
+                    Ok(true) => {
+                        tracing::info!("voice[{}] dave: op{op} processed, preparing transition {id} (v{ver})", self.p.guild_id);
+                        self.begin_transition(id, ver).await?;
                     }
+                    Ok(false) => tracing::debug!("voice[{}] dave: commit for transition {id} ignored", self.p.guild_id),
                     Err(e) => { tracing::warn!("dave commit/welcome: {e}"); self.recover(Some(id)).await?; }
                 }
             }
