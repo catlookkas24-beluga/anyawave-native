@@ -47,6 +47,8 @@ impl Shards {
 
 struct App {
     auth: auth::Auth,
+    hifi_max: usize,                            // AW_HIFI_MAX (default 2): concurrent /hifi/stream encodes
+    hifi_slots: Arc<tokio::sync::Semaphore>,
     shards: Shards,
     sessions: Mutex<HashMap<String, Arc<Session>>>,
     started: Instant,
@@ -102,11 +104,14 @@ async fn main() {
     let stop = Arc::new(AtomicBool::new(false));
     let n = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).clamp(1, 4);
     let shards = Shards { tx: (0..n).map(|i| spawn_shard(&format!("aw-shard-{i}"), stop.clone()).tx).collect(), next: AtomicUsize::new(0) };
+    let hifi_max: usize = std::env::var("AW_HIFI_MAX").ok().and_then(|v| v.parse().ok()).filter(|n| *n > 0).unwrap_or(2);
     let app = Arc::new(App {
         auth: match auth::Auth::from_env() {
             Ok(a) => a,
             Err(e) => { eprintln!("refusing to start: {e}"); std::process::exit(1); }
         },
+        hifi_max,
+        hifi_slots: Arc::new(tokio::sync::Semaphore::new(hifi_max)),
         shards, sessions: Mutex::new(HashMap::new()), started: Instant::now(), counter: AtomicUsize::new(0),
     });
     let r = Router::new()
@@ -155,7 +160,8 @@ fn stats_json(app: &App) -> Value {
     json!({"players":players,"playingPlayers":playing,"uptime":app.started.elapsed().as_millis() as u64,
         "memory":{"free":0,"used":0,"allocated":0,"reservable":0},
         "cpu":{"cores":cores,"systemLoad":0.0,"lavalinkLoad":0.0},
-        "frameStats":{"sent":sent,"nulled":nulled,"deficit":deficit}})   // deficit = underruns = stutter KPI
+        "frameStats":{"sent":sent,"nulled":nulled,"deficit":deficit},
+        "hifi":{"active":app.hifi_max.saturating_sub(app.hifi_slots.available_permits()),"max":app.hifi_max}})   // deficit = underruns = stutter KPI
 }
 async fn stats(State(app): State<Arc<App>>) -> Json<Value> { Json(stats_json(&app)) }
 
@@ -518,9 +524,23 @@ async fn hifi_stream(State(app): State<Arc<App>>, Query(q): Query<HashMap<String
     if !ffmpeg_ok { return (StatusCode::SERVICE_UNAVAILABLE, "ffmpeg is not installed on this server").into_response(); }
     let (ct, label) = hifi::content_type(tier, fmt);
 
+    // Each stream = 1 decoder thread + 1 ffmpeg process. Cap them so a few listeners cannot starve the Discord audio shards.
+    // The slot is held until the encode finishes (including when the client disconnects, which ends the write loop).
+    let permit = match app.hifi_slots.clone().try_acquire_owned() {
+        Ok(p) => p,
+        Err(_) => {
+            return Response::builder()
+                .status(StatusCode::SERVICE_UNAVAILABLE)
+                .header("Retry-After", "5")
+                .body(Body::from(format!("hi-fi streams busy (max {} at once), retry shortly", app.hifi_max)))
+                .unwrap();
+        }
+    };
+
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(8);
     let tx2 = tx.clone();
     tokio::task::spawn_blocking(move || {
+        let _permit = permit;   // dropped when this closure ends
         let configure: Option<Box<dyn Fn(&mut FilterChain) + Send>> = filters.map(|f| {
             Box::new(move |c: &mut FilterChain| filters::apply(c, &f, 100)) as Box<dyn Fn(&mut FilterChain) + Send>
         });
