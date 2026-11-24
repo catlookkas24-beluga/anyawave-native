@@ -32,6 +32,7 @@ use std::{
 };
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
+mod auth;
 mod filters;
 mod xfade;
 
@@ -45,7 +46,7 @@ impl Shards {
 }
 
 struct App {
-    password: String,
+    auth: auth::Auth,
     shards: Shards,
     sessions: Mutex<HashMap<String, Arc<Session>>>,
     started: Instant,
@@ -81,17 +82,31 @@ struct Player {
 
 fn now_ms() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0) }
 fn emit(s: &Session, v: Value) { let _ = s.events.send(v.to_string()); }
-fn authed(app: &App, h: &HeaderMap) -> bool { h.get("authorization").map(|v| v == app.password.as_str()).unwrap_or(false) }
+fn authed(app: &App, h: &HeaderMap) -> bool {
+    let presented = h.get("authorization").and_then(|v| v.to_str().ok()).unwrap_or("");
+    app.auth.check(presented)
+}
 fn unauthorized() -> (StatusCode, Json<Value>) { (StatusCode::UNAUTHORIZED, Json(json!({"error":"Unauthorized"}))) }
 
 #[tokio::main]
 async fn main() {
+    // `aw-server --make-digest` (password on stdin) prints the value for AW_PASSWORD_DIGEST and exits.
+    if std::env::args().any(|a| a == "--make-digest") {
+        match auth::make_digest_from_stdin() {
+            Ok(h) => println!("{h}"),
+            Err(e) => { eprintln!("{e}"); std::process::exit(1); }
+        }
+        return;
+    }
     tracing_subscriber::fmt::init();
     let stop = Arc::new(AtomicBool::new(false));
     let n = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).clamp(1, 4);
     let shards = Shards { tx: (0..n).map(|i| spawn_shard(&format!("aw-shard-{i}"), stop.clone()).tx).collect(), next: AtomicUsize::new(0) };
     let app = Arc::new(App {
-        password: std::env::var("AW_PASSWORD").unwrap_or("youshallnotpass".into()),
+        auth: match auth::Auth::from_env() {
+            Ok(a) => a,
+            Err(e) => { eprintln!("refusing to start: {e}"); std::process::exit(1); }
+        },
         shards, sessions: Mutex::new(HashMap::new()), started: Instant::now(), counter: AtomicUsize::new(0),
     });
     let r = Router::new()
@@ -433,8 +448,8 @@ async fn ws_loop(app: Arc<App>, uid: u64, mut s: WebSocket) {
 
 // ------------------------------------------------------------------ pipeline self-test
 async fn debug_probe(State(app): State<Arc<App>>, Query(q): Query<HashMap<String, String>>) -> Json<Value> {
-    if q.get("key").map(|k| k.as_str()) != Some(app.password.as_str()) {
-        return Json(json!({"error":"unauthorized: add &key=<AW_PASSWORD>"}));
+    if !app.auth.check(q.get("key").map(|k| k.as_str()).unwrap_or("")) {
+        return Json(json!({"error":"unauthorized: add &key=<password>"}));
     }
     let Some(url) = q.get("url").cloned() else { return Json(json!({"error":"missing &url="})) };
     let secs: u64 = q.get("secs").and_then(|s| s.parse().ok()).unwrap_or(10).clamp(1, 60);
@@ -482,11 +497,11 @@ async fn hifi_tiers() -> Json<Value> {
     Json(tokio::task::spawn_blocking(hifi::describe).await.unwrap_or_else(|e| json!({"error": e.to_string()})))
 }
 
-/// GET /hifi/stream?key=<AW_PASSWORD>&url=<audio url>&tier=efficient|high|lossless|hires
+/// GET /hifi/stream?key=<password>&url=<audio url>&tier=efficient|high|lossless|hires
 ///                 [&format=flac|alac|wav] [&t=<start seconds>] [&filters=<url-encoded filters JSON>]
 async fn hifi_stream(State(app): State<Arc<App>>, Query(q): Query<HashMap<String, String>>) -> Response {
-    if q.get("key").map(|k| k.as_str()) != Some(app.password.as_str()) {
-        return (StatusCode::UNAUTHORIZED, "add &key=<AW_PASSWORD>").into_response();
+    if !app.auth.check(q.get("key").map(|k| k.as_str()).unwrap_or("")) {
+        return (StatusCode::UNAUTHORIZED, "add &key=<password>").into_response();
     }
     let Some(url) = q.get("url").cloned() else { return (StatusCode::BAD_REQUEST, "missing &url=").into_response() };
     let tier = match q.get("tier").map(|s| s.as_str()).unwrap_or("lossless") {
@@ -527,10 +542,10 @@ async fn hifi_stream(State(app): State<Arc<App>>, Query(q): Query<HashMap<String
 }
 
 // ------------------------------------------------------------------ SoundCloud diagnostics
-/// GET /debug/sc?key=<AW_PASSWORD>&url=<soundcloud link>  -> which step works / fails
+/// GET /debug/sc?key=<password>&url=<soundcloud link>  -> which step works / fails
 async fn debug_sc(State(app): State<Arc<App>>, Query(q): Query<HashMap<String, String>>) -> Json<Value> {
-    if q.get("key").map(|k| k.as_str()) != Some(app.password.as_str()) {
-        return Json(json!({"error": "add &key=<AW_PASSWORD>"}));
+    if !app.auth.check(q.get("key").map(|k| k.as_str()).unwrap_or("")) {
+        return Json(json!({"error": "add &key=<password>"}));
     }
     let Some(url) = q.get("url").cloned() else { return Json(json!({"error": "missing &url="})) };
     Json(tokio::task::spawn_blocking(move || aw_engine::sources::soundcloud::diagnose(&url)).await
