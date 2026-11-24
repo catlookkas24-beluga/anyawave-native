@@ -15,4 +15,4 @@ aes-gcm.workspace = true
 chacha20poly1305.workspace = true
 socket2.workspace = true
 rtrb.workspace = true
-davey = "0.1"          # Discord DAVE (MLS) E2EE, MIT, pure Rust
+davey = "0.2"          # Discord DAVE (MLS) E2EE, MIT, pure Rust. 0.2 = prepare/execute transition model (needs Rust 1.85+, edition 2024)
