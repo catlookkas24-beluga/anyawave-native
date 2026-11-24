@@ -14,3 +14,9 @@
 	•	Passwords must be at least 20 characters.
 	•	Generate the value with aw-server --make-digest.
 	•	The full main.rs now uses this system, including /hifi/stream and /debug/*.
+3. Hi-fi stream concurrency limit: done, untested
+
+	•	New env var AW_HIFI_MAX (default 2). Extra requests get 503 with Retry-After: 5.
+	•	Slots are released when encoding finishes or the listener disconnects.
+	•	/v4/stats shows "hifi":{"active":N,"max":M}.
+	•	Set the value after measuring realtime_factor with /debug/probe on Render
